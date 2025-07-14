@@ -7,7 +7,7 @@ from datetime import datetime
 import pandas as pd
 from typing import List, Tuple, Dict, Callable
 from collections import deque
-
+from typing import Optional, Callable
 class KalmanTracker:
     def __init__(self, initial_center: Tuple[int, int]):
         """
@@ -282,13 +282,28 @@ class IntrusionDetector:
         
         # 新增：事件回调函数
         self.event_callbacks: List[Callable] = []
+        self.report_alert_callback: Optional[Callable] = None
+        
+        # 设备信息配置
+        self.device_info = {
+            'deviceId': 0,
+            'deviceName': '默认摄像头',
+            'facilityId': 1,
+            'facilityName': '默认设施'
+        }
 
+        
     def add_event_callback(self, callback: Callable):
         """
         添加事件回调函数
         :param callback: 当检测到事件时调用的函数
         """
-        self.event_callbacks.append(callback)
+        if callback not in self.event_callbacks:
+            self.event_callbacks.append(callback)
+
+    def set_report_alert_callback(self, callback: Callable):
+        """【新增】设置上报告警到RuoYi的回调函数"""
+        self.report_alert_callback = callback
 
     def _trigger_event_callbacks(self, event: Dict):
         """
@@ -299,7 +314,27 @@ class IntrusionDetector:
             try:
                 callback(event)
             except Exception as e:
-                print(f"事件回调函数执行出错: {str(e)}")
+                print(f"执行WebSocket事件回调时出错: {str(e)}")
+    def _trigger_report_alert(self, event_data: Dict):
+        """【新增】触发上报告警到RuoYi的回调函数"""
+        if self.report_alert_callback:
+            try:
+                # 准备上报给RuoYi的数据
+                report_data = {
+                    "deviceId": event_data.get('deviceId'),
+                    "facilityId": event_data.get('facilityId'),
+                    "personId": event_data.get('person_id'),
+                    "confidence": event_data.get('confidence'),
+                    "position": event_data.get('position'),
+                    "remark": f"在 {event_data.get('facilityName', '')} 的 {event_data.get('deviceName', '')} 检测到人员",
+                    # "screenshotUrl": "..." # 可以在这里添加截图上传逻辑
+                }
+                self.report_alert_callback(report_data)
+            except Exception as e:
+                print(f"执行上报告警回调时出错: {str(e)}")
+        else:
+            print("警告: 未设置上报告警回调函数，无法上报。")
+
 
     def should_alert(self, person_id: str, current_time: float) -> bool:
         """
@@ -381,12 +416,18 @@ class IntrusionDetector:
                     'confidence': confidence,
                     'position': [center[0], center[1]],
                     'velocity': [velocity[0], velocity[1]],
-                    'camera_id': self.current_camera_id,
                     'person_id': person_id,
-                    'time_since_first': current_time - self.person_timestamps[person_id]
+                    'time_since_first': current_time - self.person_timestamps[person_id],
+                    # 【新增】将设备和设施信息加入事件
+                    'deviceId': camera_id,
+                    'deviceName': self.device_info.get('deviceName', '未知设备'),
+                    'facilityId': self.device_info.get('facilityId'),
+                    'facilityName': self.device_info.get('facilityName', '未知设施')
                 }
                 self.events.append(event)
                 self.person_alert_times[person_id] = current_time # 更新该ID的最后报警时间
+                self._trigger_event_callbacks(event)
+                self._trigger_report_alert(event)
                 print(f"触发告警: {event}")
                 
                 # 立即触发事件回调

@@ -1,0 +1,28 @@
+{
+  "rtsp_mapping": {
+    "3": {
+      "name": "摄像头001",
+      "rtsp_url": "rtsp://admin:fxt060919@210.22.177.90:554/cam/realmonitor?channel=1&subtype=0",
+      "description": "从RuoYi获取的真实地址"
+    },
+    "4": {
+      "name": "摄像头002", 
+      "rtsp_url": "rtsp://admin:fxt060919@192.168.0.123:554/cam/realmonitor?channel=1&subtype=0",
+      "description": "从RuoYi获取的真实地址"
+    }
+  },
+  "common_rtsp_formats": {
+    "hikvision": "rtsp://username:password@ip:554/Streaming/Channels/101",
+    "dahua": "rtsp://username:password@ip:554/cam/realmonitor?channel=1&subtype=0",
+    "generic": "rtsp://username:password@ip:554/stream1"
+  },
+  "notes": [
+    "请将上述IP地址、用户名、密码替换为您的实际摄像头配置",
+    "常见的摄像头默认用户名/密码组合：",
+    "  - admin/admin",
+    "  - admin/123456", 
+    "  - admin/admin123",
+    "  - root/root",
+    "如果不知道摄像头IP地址，请查看摄像头说明书或联系网络管理员"
+  ]
+} 

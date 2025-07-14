@@ -24,7 +24,7 @@
 - **系统状态监控**: 实时显示系统运行状态
 
 ### 企业级部署
-- **多摄像头支持**: 支持9个摄像头点位同时监控
+- **动态设备管理**: 从RuoYi系统动态获取摄像头设备配置
 - **系统服务**: 提供systemd服务配置
 - **Nginx反向代理**: 生产环境部署支持
 - **容器化部署**: 支持Docker容器化部署
@@ -33,13 +33,13 @@
 
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   RTSP摄像头    │    │   YOLOv8检测    │    │   卡尔曼跟踪    │
-│   视频流输入    │───▶│   人体检测      │───▶│   人员跟踪      │
+│   RuoYi系统     │    │   YOLOv8检测    │    │   卡尔曼跟踪    │
+│   设备管理      │───▶│   人体检测      │───▶│   人员跟踪      │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
-                                                        │
+        │                                              │
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   WebSocket     │    │   告警系统      │    │   事件记录      │
-│   实时推送      │◀───│   入侵检测      │◀───│   CSV存储       │
+│   动态设备      │    │   告警系统      │    │   事件记录      │
+│   配置加载      │◀───│   入侵检测      │◀───│   CSV存储       │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
         │
 ┌─────────────────┐
@@ -91,35 +91,46 @@ wget https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt
 
 ### 3. 配置设置
 
-编辑 `app.py` 中的RTSP URL：
+编辑 `python/app_vue.py` 中的配置：
+
 ```python
-rtsp_url = "rtsp://username:password@ip:port/stream"
+# RuoYi后端地址
+RUOYI_BASE_URL = "http://192.168.0.189:8080"
+
+# Python客户端凭证 (必须与RuoYi yml文件中的配置一致)
+APP_KEY = "yolo-client"
+APP_SECRET = "pFztYpMTYXQBmAUZRTaZ"  # 修改为您的专用密码
 ```
 
 ### 4. 启动系统
 
 ```bash
-# 启动Web服务器
-python app.py
+# 启动后端服务
+cd python
+python app_vue.py
+
+# 启动前端服务（新终端）
+npm run dev
 ```
 
-访问 `http://localhost:5000` 查看监控界面。
+访问 `http://localhost:3000` 查看监控界面。
 
 ## 🎯 使用方法
 
 ### Web界面操作
 
 1. **系统登录**: 打开浏览器访问系统地址
-2. **视频监控**: 查看实时视频流和检测结果
-3. **告警查看**: 在左侧面板查看实时告警信息
-4. **系统状态**: 监控系统运行状态和连接状态
+2. **设备管理**: 系统自动从RuoYi获取摄像头设备列表
+3. **视频监控**: 点击设备列表中的设备进行实时监控
+4. **告警查看**: 在左侧面板查看实时告警信息
+5. **系统状态**: 监控系统运行状态和连接状态
 
-### 摄像头配置
+### 动态设备管理
 
-系统支持9个摄像头点位：
-- 三楼机房：1号、2号、3号点位
-- 四楼机房：1号、2号、3号点位  
-- 五楼机房：1号、2号、3号点位
+系统现在支持从RuoYi系统动态获取摄像头设备：
+- **自动设备发现**: 系统启动时自动从RuoYi获取设备列表
+- **实时状态更新**: 显示设备在线/离线状态
+- **灵活配置**: 支持动态添加/删除设备，无需重启系统
 
 ### 告警机制
 
@@ -131,7 +142,7 @@ python app.py
 
 ### 检测参数调整
 
-在 `intrusion_detector.py` 中可以调整以下参数：
+在 `python/intrusion_detector.py` 中可以调整以下参数：
 
 ```python
 # 检测置信度阈值
@@ -145,6 +156,14 @@ min_hits = 1             # 最小命中次数
 # 告警时间间隔
 alert_intervals = [10, 30, 60]  # 秒
 ```
+
+### API端点
+
+系统提供以下API端点：
+
+- `GET /api/devices` - 获取设备列表
+- `GET /video_feed/<device_id>` - 获取设备视频流
+- `POST /api/yolo/alert/report` - 上报告警信息
 
 ### 性能优化
 
@@ -160,7 +179,7 @@ alert_intervals = [10, 30, 60]  # 秒
 - 时间戳
 - 检测置信度
 - 人员位置坐标
-- 摄像头ID
+- 设备ID
 - 人员ID
 - 持续时间
 
@@ -184,7 +203,7 @@ RUN pip install -r requirements.txt
 COPY . .
 EXPOSE 5000
 
-CMD ["python", "app.py"]
+CMD ["python", "app_vue.py"]
 ```
 
 ### Nginx配置
@@ -194,12 +213,27 @@ server {
     listen 80;
     server_name your-domain.com;
     
+    # 前端静态文件
     location / {
+        root /path/to/frontend/dist;
+        try_files $uri $uri/ /index.html;
+    }
+    
+    # 后端API代理
+    location /api/ {
         proxy_pass http://localhost:5000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
     }
     
+    # 视频流代理
+    location /video_feed/ {
+        proxy_pass http://localhost:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+    
+    # WebSocket代理
     location /socket.io {
         proxy_pass http://localhost:5000;
         proxy_http_version 1.1;
@@ -219,9 +253,9 @@ After=network.target
 [Service]
 Type=simple
 User=www-data
-WorkingDirectory=/path/to/yolo_waring
+WorkingDirectory=/path/to/yolo_waring/python
 Environment=PATH=/path/to/venv/bin
-ExecStart=/path/to/venv/bin/python app.py
+ExecStart=/path/to/venv/bin/python app_vue.py
 Restart=always
 
 [Install]
@@ -239,34 +273,29 @@ WantedBy=multi-user.target
 
 - **检测精度**: >95% 人体检测准确率
 - **响应时间**: <100ms 告警响应时间
-- **并发支持**: 支持多摄像头同时监控
+- **并发支持**: 支持多设备同时监控
 - **系统稳定性**: 99.9% 系统可用性
 
 ## 🤝 技术支持
 
 ### 常见问题
 
-1. **视频流连接失败**: 检查RTSP URL和网络连接
-2. **检测效果不佳**: 调整置信度阈值和跟踪参数
-3. **系统性能问题**: 检查GPU配置和内存使用
+1. **设备列表获取失败**: 检查RuoYi系统连接和认证配置
+2. **视频流连接失败**: 检查RTSP URL和网络连接
+3. **检测效果不佳**: 调整置信度阈值和跟踪参数
 
-### 联系支持
+### 测试工具
 
-- 技术文档: [项目Wiki]
-- 问题反馈: [GitHub Issues]
-- 技术支持: [联系邮箱]
+项目包含 `test_api.html` 测试页面，可用于验证API功能：
+- 基础连接测试
+- 设备列表API测试
+- 视频流API测试
 
-## 📄 许可证
+## 📝 更新日志
 
-本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
-
-## 🙏 致谢
-
-- [Ultralytics](https://github.com/ultralytics/ultralytics) - YOLOv8模型
-- [OpenCV](https://opencv.org/) - 计算机视觉库
-- [Flask](https://flask.palletsprojects.com/) - Web框架
-- [Socket.IO](https://socket.io/) - 实时通信
-
----
-
-**© 2025 陕西国网无计划作业检测系统 - 为电力安全保驾护航** 
+### v2.0.0 (2025-01-XX)
+- ✨ 新增动态设备管理功能
+- 🔄 从RuoYi系统自动获取设备配置
+- 🎨 优化前端界面，支持动态设备列表
+- 🐛 修复多个已知问题
+- 📚 更新文档和部署说明 

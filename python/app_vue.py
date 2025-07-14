@@ -1,333 +1,309 @@
-from flask import Flask, render_template, Response, send_from_directory, request
-from flask_socketio import SocketIO
-from flask_cors import CORS
+# python/app_vue.py
+
 import cv2
-import numpy as np
-from intrusion_detector import IntrusionDetector
 import json
+import numpy as np
+import os
+import queue
+import requests
 import threading
 import time
-import queue
-import os
 
+from flask import Flask, Response, request, send_from_directory
+from flask_cors import CORS
+from flask_socketio import SocketIO
+from intrusion_detector import IntrusionDetector
+
+# --- 1. 全局配置 ---
+RUOYI_BASE_URL = "http://192.168.0.189:8080"
+RUOYI_DEVICE_LIST_URL = f"{RUOYI_BASE_URL}/api/yolo/device/list"
+RUOYI_AUTH_URL = f"{RUOYI_BASE_URL}/api/auth/token"
+APP_KEY = "yolo-client"
+APP_SECRET = "pFztYpMTYXQBmAUZRTaZ"
+
+USE_HTTPS = RUOYI_BASE_URL.startswith('https://')
+VERIFY_SSL = True
+
+# --- 2. 全局变量 ---
 app = Flask(__name__)
+CORS(app, origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:5173", "http://127.0.0.1:5173"])
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-# 配置CORS，允许跨域请求（开发环境）
-CORS(app, origins=["http://localhost:3000", "http://127.0.0.1:3000"])
-
-# 配置SocketIO，允许跨域
-socketio = SocketIO(app, cors_allowed_origins=["http://localhost:3000", "http://127.0.0.1:3000", "*"], 
-                   async_mode='threading', ping_timeout=10, ping_interval=5)
-
-# 全局变量
 detector = None
-camera = None
 is_running = False
-rtsp_url = "rtsp://admin:fxt060919@192.168.0.123:554/cam/realmonitor?channel=1&subtype=0"
-
-# 最新的帧
-latest_frame = None
-latest_processed_frame = None
+devices_info = {}
+latest_processed_frames = {}
 frame_lock = threading.Lock()
 
-def generate_frames(camera_index):
-    global latest_processed_frame
+def load_rtsp_mapping():
+    """从配置文件加载RTSP地址映射"""
+    try:
+        with open('rtsp_config.json', 'r', encoding='utf-8') as f:
+            config = json.load(f)
+            mapping = {}
+            for device_id, device_config in config.get('rtsp_mapping', {}).items():
+                mapping[device_id] = device_config['rtsp_url']
+            return mapping
+    except:
+        return {
+            '3': 'rtsp://admin:admin123@192.168.1.100:554/stream1',
+            '4': 'rtsp://admin:admin123@192.168.1.101:554/stream1',
+        }
+
+RTSP_URL_MAPPING = load_rtsp_mapping()
+auth_token = None
+token_expire_time = 0
+
+# --- 3. 认证与数据获取 ---
+def get_ruoyi_auth_token():
+    """获取或刷新RuoYi的认证Token"""
+    global auth_token, token_expire_time
+
+    if auth_token and token_expire_time > time.time() + 300:
+        return auth_token
+
+    payload = {"appKey": APP_KEY, "appSecret": APP_SECRET}
+    verify_param = VERIFY_SSL if USE_HTTPS else False
     
-    # 只有三楼机房一号位（camera_id=0）才返回真实视频流
-    if camera_index != 0:
-        # 其他摄像头返回占位符图像
-        placeholder_frame = create_placeholder_frame(camera_index)
-        ret, buffer = cv2.imencode('.jpg', placeholder_frame)
-        frame = buffer.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+    try:
+        response = requests.post(RUOYI_AUTH_URL, json=payload, timeout=5, verify=verify_param)
+        if response.status_code == 200 and response.json().get('code') == 200:
+            auth_token = response.json().get('data')
+            token_expire_time = time.time() + (720 - 10) * 60
+            return auth_token
+    except Exception as e:
+        print(f"获取Token失败: {e}")
+    return None
+
+def load_devices_from_ruoyi():
+    """从RuoYi后端加载设备信息"""
+    global devices_info
+    token = get_ruoyi_auth_token()
+    if not token:
+        devices_info = {}
         return
+
+    headers = {"Authorization": f"Bearer {token}"}
+    verify_param = VERIFY_SSL if USE_HTTPS else False
     
-    while is_running:
-        # 检查 detector 是否已初始化
-        if detector is None:
-            time.sleep(0.1)
-            continue
+    try:
+        response = requests.get(RUOYI_DEVICE_LIST_URL, headers=headers, timeout=10, verify=verify_param)
+        if response.status_code == 200 and response.json().get('code') == 200:
+            devices_list = response.json().get('data', [])
+            devices_info = {str(device['deviceId']): device for device in devices_list}
             
-        with frame_lock:
-            if latest_processed_frame is None:
+            for device_id, device_data in devices_info.items():
+                rtsp_url = device_data.get('url', '') or device_data.get('rtspUrl', '')
+                
+                if not rtsp_url and str(device_id) in RTSP_URL_MAPPING:
+                    device_data['rtspUrl'] = RTSP_URL_MAPPING[str(device_id)]
+                elif rtsp_url:
+                    device_data['rtspUrl'] = rtsp_url
+                
+                # 确保facilityName字段存在
+                if 'facilityName' not in device_data:
+                    device_data['facilityName'] = None
+    except Exception as e:
+        print(f"加载设备失败: {e}")
+
+# --- 4. 核心视频处理逻辑 ---
+def process_single_device(device_id, device_info):
+    """处理单个设备的视频流"""
+    global latest_processed_frames, detector
+    rtsp_url = device_info.get('rtspUrl')
+    if not rtsp_url:
+        return
+
+    cap = cv2.VideoCapture(rtsp_url)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    while is_running:
+        if not cap.isOpened():
+            time.sleep(5)
+            cap.release()
+            cap = cv2.VideoCapture(rtsp_url)
+            continue
+
+        success, frame = cap.read()
+        if not success:
+            time.sleep(0.5)
+            continue
+
+        try:
+            if detector is None:
                 time.sleep(0.1)
                 continue
-            frame = latest_processed_frame.copy()
-        
-        # 将帧转换为JPEG格式
-        ret, buffer = cv2.imencode('.jpg', frame)
-        frame = buffer.tobytes()
-        
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            processed_frame = detector.process_frame(frame, device_id)
+            with frame_lock:
+                latest_processed_frames[device_id] = processed_frame
+        except Exception as e:
+            print(f"处理帧错误: {e}")
 
-def create_placeholder_frame(camera_index):
-    """创建占位符图像"""
-    # 创建黑色背景
-    frame = np.zeros((480, 640, 3), dtype=np.uint8)
-    
-    # 摄像头位置映射
-    locations = {
-        0: '三楼机房1号点位', 1: '三楼机房2号点位', 2: '三楼机房3号点位',
-        3: '四楼机房1号点位', 4: '四楼机房2号点位', 5: '四楼机房3号点位',
-        6: '五楼机房1号点位', 7: '五楼机房2号点位', 8: '五楼机房3号点位'
-    }
-    
-    location_name = locations.get(camera_index, f'摄像头{camera_index}')
-    
-    # 添加文字
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 1.2
-    thickness = 2
-    color = (255, 255, 255)  # 白色文字
-    
-    # 计算文字位置使其居中
-    text_size = cv2.getTextSize(location_name, font, font_scale, thickness)[0]
-    text_x = (frame.shape[1] - text_size[0]) // 2
-    text_y = (frame.shape[0] + text_size[1]) // 2
-    
-    # 绘制文字
-    cv2.putText(frame, location_name, (text_x, text_y), font, font_scale, color, thickness)
-    
-    # 添加"暂无视频流"提示
-    status_text = "暂无视频流"
-    status_font_scale = 0.8
-    status_thickness = 1
-    status_color = (128, 128, 128)  # 灰色文字
-    
-    status_text_size = cv2.getTextSize(status_text, font, status_font_scale, status_thickness)[0]
-    status_text_x = (frame.shape[1] - status_text_size[0]) // 2
-    status_text_y = text_y + 60
-    
-    cv2.putText(frame, status_text, (status_text_x, status_text_y), font, status_font_scale, status_thickness)
-    
-    return frame
+        time.sleep(0.04)
 
-# Vue前端路由（生产环境）
+    cap.release()
+
+def on_intrusion_event(event):
+    """入侵事件回调函数"""
+    try:
+        socketio.emit('intrusion_alert', event)
+    except Exception as e:
+        print(f"发送通知失败: {e}")
+
+# --- 5. Flask & SocketIO 路由 ---
 @app.route('/')
 def index():
-    # 如果存在Vue构建的文件，使用Vue版本
-    if os.path.exists('dist/index.html'):
-        return send_from_directory('dist', 'index.html')
-    else:
-        # 否则使用原始模板
-        return render_template('index.html')
+    return "YOLO AI-Warning-Service is running."
 
-@app.route('/<path:path>')
-def static_proxy(path):
-    """为Vue构建的静态文件提供服务"""
+@app.route('/health')
+def health_check():
+    return {'status': 'ok', 'message': 'Service is running', 'timestamp': time.time()}
+
+@app.route('/api/devices')
+def get_devices():
+    """提供设备列表，按facilityName分组"""
+    if not devices_info:
+        return {'code': 200, 'data': {}, 'message': 'success'}
+    
+    # 按facilityName分组
+    grouped_devices = {}
+    
+    for device_id, device_info in devices_info.items():
+        rtsp_url = device_info.get('rtspUrl', '')
+        if not rtsp_url and str(device_id) in RTSP_URL_MAPPING:
+            rtsp_url = RTSP_URL_MAPPING[str(device_id)]
+        
+        # 获取facilityName，如果为空则归为"未分配摄像头"
+        facility_name = device_info.get('facilityName')
+        if not facility_name:
+            facility_name = "未分配摄像头"
+        
+        # 如果该分组不存在，则创建
+        if facility_name not in grouped_devices:
+            grouped_devices[facility_name] = []
+        
+        device_data = {
+            'id': int(device_id),
+            'name': device_info.get('deviceName', f'设备{device_id}'),
+            'rtspUrl': rtsp_url,
+            'status': 'active' if device_id in latest_processed_frames else 'inactive',
+            'ip': device_info.get('ip', ''),
+            'type': device_info.get('type', ''),
+            'userName': device_info.get('userName', ''),
+            'facilityName': facility_name
+        }
+        
+        grouped_devices[facility_name].append(device_data)
+    
+    return {'code': 200, 'data': grouped_devices, 'message': 'success'}
+
+@app.route('/api/devices/refresh', methods=['POST'])
+def refresh_devices():
+    """手动刷新设备列表"""
     try:
-        # 首先尝试从dist目录提供文件
-        if os.path.exists('dist'):
-            return send_from_directory('dist', path)
-        else:
-            # 回退到Flask的静态文件
-            return send_from_directory('static', path)
+        global devices_info
+        load_devices_from_ruoyi()
+        
+        # 重新启动视频处理线程
+        for device_id, device_data in devices_info.items():
+            # 检查是否已经有该设备的处理线程在运行
+            if device_id not in latest_processed_frames:
+                thread = threading.Thread(target=process_single_device, args=(device_id, device_data))
+                thread.daemon = True
+                thread.start()
+        
+        return {'code': 200, 'message': '设备列表刷新成功', 'data': {'device_count': len(devices_info)}}
     except Exception as e:
-        print(f"静态文件服务错误: {e}")
-        # 如果文件不存在，返回Vue的index.html（用于SPA路由）
-        if os.path.exists('dist/index.html'):
-            return send_from_directory('dist', 'index.html')
-        else:
-            return "文件未找到", 404
+        return {'code': 500, 'message': f'刷新设备列表失败: {str(e)}', 'data': None}
 
-# 原始模板路由（向后兼容）
-@app.route('/original')
-def original_index():
-    return render_template('index.html')
+@app.route('/api/devices/<int:device_id>/status')
+def get_device_status(device_id):
+    """获取单个设备状态"""
+    if not devices_info:
+        return {'code': 404, 'message': '设备信息未加载', 'data': None}
+    
+    device_info = devices_info.get(str(device_id))
+    if not device_info:
+        return {'code': 404, 'message': f'设备 {device_id} 不存在', 'data': None}
+    
+    # 检查设备是否在线，使用字符串类型的设备ID
+    is_online = str(device_id) in latest_processed_frames
+    
+    # 获取设备状态信息
+    status_info = {
+        'deviceId': device_id,
+        'deviceName': device_info.get('deviceName', f'设备{device_id}'),
+        'status': 'online' if is_online else 'offline',
+        'lastUpdate': time.time(),
+        'rtspUrl': device_info.get('rtspUrl', ''),
+        'isProcessing': is_online,
+        'frameCount': len(latest_processed_frames) if is_online else 0
+    }
+    
+    return {'code': 200, 'data': status_info, 'message': 'success'}
 
-# 视频流端点
 @app.route('/video_feed/<int:camera_id>')
 def video_feed(camera_id):
-    """视频流端点"""
-    print(f"请求视频流: 摄像头 {camera_id}")
-    return Response(generate_frames(camera_id),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+    """提供实时视频流"""
+    def generate():
+        while True:
+            with frame_lock:
+                # 确保使用字符串类型的设备ID来查找帧
+                frame = latest_processed_frames.get(str(camera_id))
+            if frame is not None:
+                ret, buffer = cv2.imencode('.jpg', frame)
+                if ret:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            time.sleep(0.04)
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-# 系统状态API端点
-@app.route('/api/system/status')
-def system_status():
-    """系统状态API"""
-    return {
-        'status': 'running' if is_running else 'stopped',
-        'detector_initialized': detector is not None,
-        'camera_connected': camera is not None,
-        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
-    }
-
-# 摄像头列表API端点
-@app.route('/api/cameras')
-def cameras_list():
-    """摄像头列表API"""
-    cameras = [
-        {'id': 0, 'name': '三楼机房1号点位', 'status': 'active'},
-        {'id': 1, 'name': '三楼机房2号点位', 'status': 'inactive'},
-        {'id': 2, 'name': '三楼机房3号点位', 'status': 'inactive'},
-        {'id': 3, 'name': '四楼机房1号点位', 'status': 'inactive'},
-        {'id': 4, 'name': '四楼机房2号点位', 'status': 'inactive'},
-        {'id': 5, 'name': '四楼机房3号点位', 'status': 'inactive'},
-        {'id': 6, 'name': '五楼机房1号点位', 'status': 'inactive'},
-        {'id': 7, 'name': '五楼机房2号点位', 'status': 'inactive'},
-        {'id': 8, 'name': '五楼机房3号点位', 'status': 'inactive'}
-    ]
-    return {'cameras': cameras}
-
-# Socket.IO事件处理
 @socketio.on('connect')
 def handle_connect():
-    print('客户端连接成功')
-    # 发送系统状态信息
-    socketio.emit('system_status', {
-        'status': 'connected',
-        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'message': '系统连接正常'
-    })
+    socketio.emit('system_status', {'message': 'AI服务连接成功'})
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    print('客户端断开连接')
+    pass
 
-@socketio.on('ping')
-def handle_ping():
-    """处理客户端ping"""
-    socketio.emit('pong')
+# --- 6. 主程序入口 ---
+def start_detection_service():
+    """启动AI检测服务"""
+    global detector, is_running
 
-def on_intrusion_event(event):
-    """
-    入侵事件回调函数，直接处理检测到的事件
-    """
-    try:
-        # 确保事件数据格式正确
-        event_data = {
-            'timestamp': event['timestamp'],
-            'confidence': float(event['confidence']) if event['confidence'] != -1.0 else 0.95,
-            'position': [float(event['position'][0]), float(event['position'][1])],
-            'camera_id': event.get('camera_id', 0),
-            'person_id': event.get('person_id', 'unknown'),
-            'time_since_first': event.get('time_since_first', 0)
-        }
-        
-        # 立即发送事件到所有连接的客户端
-        socketio.emit('intrusion_alert', event_data)
-        print(f"实时发送告警信息: {event_data}")
-        
-        # 发送系统状态更新
-        socketio.emit('system_status', {
-            'status': 'alert_sent',
-            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'message': f'检测到入侵事件，人员ID: {event_data["person_id"]}'
-        })
-        
-    except Exception as e:
-        print(f"处理入侵事件时出错: {str(e)}")
-
-def start_detection():
-    global detector, camera, is_running
-    
-    print("正在启动入侵检测系统...")
-    
-    # 初始化检测器
-    detector = IntrusionDetector()
-    print("检测器初始化完成")
-    
-    # 注册事件回调函数
-    detector.add_event_callback(on_intrusion_event)
-    print("事件回调函数已注册")
-    
-    # 打开RTSP视频流
-    camera = cv2.VideoCapture(rtsp_url)
-    camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    print(f"RTSP视频流已连接: {rtsp_url}")
-    
+    print("启动AI告警服务")
     is_running = True
-    
-    # 启动视频读取线程
-    video_thread = threading.Thread(target=video_loop)
-    video_thread.daemon = True
-    video_thread.start()
-    print("视频读取线程已启动")
-    
-    # 启动检测线程
-    detection_thread = threading.Thread(target=detection_loop)
-    detection_thread.daemon = True
-    detection_thread.start()
-    print("检测线程已启动")
-    
-    print("入侵检测系统启动完成，开始持续监控...")
 
-def video_loop():
-    global camera, is_running, latest_frame
-    
-    print("视频读取线程已启动，开始读取视频流...")
-    frame_count = 0
-    
-    while is_running:
-        # 检查 camera 是否已初始化
-        if camera is None:
-            time.sleep(0.1)
-            continue
-            
-        success, frame = camera.read()
-        if not success:
-            print("无法读取视频流，尝试重新连接...")
-            camera.release()
-            time.sleep(1)  # 等待1秒后重试
-            camera = cv2.VideoCapture(rtsp_url)
-            camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            continue
-        
-        with frame_lock:
-            latest_frame = frame
-        
-        frame_count += 1
-        if frame_count % 100 == 0:  # 每100帧打印一次状态
-            print(f"视频读取线程运行中，已读取 {frame_count} 帧")
+    load_devices_from_ruoyi()
+    if not devices_info:
+        print("未加载到设备信息")
 
-def detection_loop():
-    """独立的检测线程，持续进行入侵检测"""
-    global detector, latest_frame, latest_processed_frame, is_running
+    detector = IntrusionDetector(model_path="yolov8n.pt")
+    detector.add_event_callback(on_intrusion_event)
+    detector.set_report_alert_callback(report_alert_to_ruoyi)
+
+    for device_id, device_data in devices_info.items():
+        thread = threading.Thread(target=process_single_device, args=(device_id, device_data))
+        thread.daemon = True
+        thread.start()
+
+def report_alert_to_ruoyi(alert_data):
+    """上报告警到RuoYi"""
+    token = get_ruoyi_auth_token()
+    if not token:
+        return
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    report_url = f"{RUOYI_BASE_URL}/api/yolo/alert/report"
+    verify_param = VERIFY_SSL if USE_HTTPS else False
     
-    print("检测线程已启动，开始持续检测...")
-    frame_count = 0
-    
-    while is_running:
-        # 检查 detector 是否已初始化
-        if detector is None:
-            time.sleep(0.1)
-            continue
-            
-        with frame_lock:
-            if latest_frame is None:
-                time.sleep(0.1)
-                continue
-            frame = latest_frame.copy()
-        
-        # 进行入侵检测处理
-        processed_frame = detector.process_frame(frame, camera_id=0)
-        
-        # 更新处理后的帧
-        with frame_lock:
-            latest_processed_frame = processed_frame
-        
-        frame_count += 1
-        if frame_count % 100 == 0:  # 每100帧打印一次状态
-            print(f"检测线程运行中，已处理 {frame_count} 帧")
-        
-        # 控制检测频率（每秒约10帧）
-        time.sleep(0.1)
+    try:
+        response = requests.post(report_url, json=alert_data, headers=headers, timeout=10, verify=verify_param)
+        if response.status_code == 200 and response.json().get('code') == 200:
+            print(f"告警上报成功: {alert_data.get('deviceId')}")
+    except Exception as e:
+        print(f"上报告警失败: {e}")
 
 if __name__ == '__main__':
-    # 检查是否需要安装flask-cors
-    try:
-        import flask_cors
-    except ImportError:
-        print("警告: flask-cors 未安装。如果需要跨域支持，请运行: pip install flask-cors")
-    
-    print("启动支持Vue前端的Flask应用...")
-    print("Vue前端开发服务器: http://localhost:3000")
-    print("Flask后端API服务器: http://localhost:5000")
-    print("原始HTML版本: http://localhost:5000/original")
-    
-    start_detection()
-    socketio.run(app, debug=True, use_reloader=False, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True) 
+    start_detection_service()
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False, use_reloader=False)

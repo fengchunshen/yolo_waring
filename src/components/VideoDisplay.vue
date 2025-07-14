@@ -1,15 +1,46 @@
 <template>
   <main class="content-area">
     <div class="camera-list">
-      <h2>摄像头列表</h2>
-      <div 
-        v-for="camera in cameras" 
-        :key="camera.id"
-        class="camera-item"
-        :class="{ 'active': camera.active }"
-        @click="toggleCamera(camera.id)"
-      >
-        {{ camera.name }}
+      <div class="camera-list-header">
+        <h2>摄像头列表</h2>
+        <button 
+          class="refresh-btn"
+          @click="refreshDevices"
+          :disabled="isRefreshing"
+          :title="isRefreshing ? '正在刷新...' : '刷新设备列表'"
+        >
+          <span class="refresh-icon" :class="{ 'rotating': isRefreshing }">🔄</span>
+        </button>
+      </div>
+      <div class="camera-groups">
+        <div 
+          v-for="(groupDevices, groupName) in groupedCameras" 
+          :key="groupName"
+          class="camera-group"
+        >
+          <div class="group-header">
+            <span class="group-name">{{ groupName }}</span>
+            <span class="group-count">({{ groupDevices.length }})</span>
+          </div>
+          <div 
+            v-for="camera in groupDevices" 
+            :key="camera.id"
+            class="camera-item"
+            :class="{ 'active': camera.active }"
+            @click="toggleCamera(camera.id)"
+          >
+            <div class="camera-info">
+              <div class="camera-name">{{ camera.name }}</div>
+              <div class="camera-details">
+                <span class="camera-ip">{{ camera.ip }}</span>
+                <span class="camera-type">{{ getDeviceTypeName(camera.type) }}</span>
+              </div>
+            </div>
+            <div class="camera-status" :class="camera.status">
+              {{ camera.status === 'active' ? '在线' : '离线' }}
+            </div>
+          </div>
+        </div>
       </div>
     </div>
     <div 
@@ -25,20 +56,19 @@
       >
         <div class="video-title">{{ camera.name }}</div>
         <div 
-          v-if="camera.id === 0 && camera.active"
+          v-if="!camera.active"
           class="video-placeholder"
-          style="display: none;"
         >
-          陕西国网
+          未激活
         </div>
         <div 
-          v-else
+          v-else-if="camera.status === 'inactive'"
           class="video-placeholder"
         >
-          {{ camera.id === 0 ? '陕西国网' : '暂无视频流' }}
+          设备离线
         </div>
         <img 
-          v-if="camera.id === 0 && camera.active"
+          v-else
           :src="getVideoUrl(camera.id)"
           class="video-container"
           @load="onVideoLoad"
@@ -50,7 +80,7 @@
 </template>
 
 <script>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { API_CONFIG } from '../config/api.js'
 
 export default {
@@ -65,8 +95,42 @@ export default {
       required: true
     }
   },
-  emits: ['toggle-camera'],
+  emits: ['toggle-camera', 'refresh-devices'],
   setup(props, { emit }) {
+    const isRefreshing = ref(false)
+    
+    // 按分组组织摄像头数据
+    const groupedCameras = computed(() => {
+      const groups = {}
+      
+      props.cameras.forEach(camera => {
+        const groupName = camera.groupName || '未分配摄像头'
+        if (!groups[groupName]) {
+          groups[groupName] = []
+        }
+        groups[groupName].push(camera)
+      })
+      
+      return groups
+    })
+
+    // 刷新设备列表
+    const refreshDevices = async () => {
+      if (isRefreshing.value) return
+      
+      isRefreshing.value = true
+      try {
+        emit('refresh-devices')
+      } catch (error) {
+        console.error('刷新设备列表失败:', error)
+      } finally {
+        // 延迟重置状态，给用户视觉反馈
+        setTimeout(() => {
+          isRefreshing.value = false
+        }, 1000)
+      }
+    }
+
     const videoDisplayClass = computed(() => {
       const activeCount = props.activeCameras.length
       if (activeCount > 4) {
@@ -85,6 +149,23 @@ export default {
       return API_CONFIG.VIDEO_STREAM.getUrl(cameraId)
     }
 
+    // 将设备类型数字转换为可读的名称
+    const getDeviceTypeName = (type) => {
+      const typeMap = {
+        '1': '网络摄像头',
+        '2': 'IP摄像头',
+        '3': '监控摄像头',
+        '4': '球机',
+        '5': '枪机',
+        '6': '半球',
+        '7': '鱼眼',
+        '8': '全景',
+        '9': '热成像',
+        '10': '门禁摄像头'
+      }
+      return typeMap[type] || `类型${type}`
+    }
+
     const onVideoLoad = (event) => {
       const img = event.target
       const placeholder = img.parentElement.querySelector('.video-placeholder')
@@ -100,15 +181,20 @@ export default {
       img.style.display = 'none'
       if (placeholder) {
         placeholder.style.display = 'block'
+        placeholder.textContent = '视频流错误'
       }
     }
 
     return {
+      groupedCameras,
       videoDisplayClass,
       toggleCamera,
       getVideoUrl,
+      getDeviceTypeName,
       onVideoLoad,
-      onVideoError
+      onVideoError,
+      refreshDevices,
+      isRefreshing
     }
   }
 }
@@ -125,7 +211,7 @@ export default {
 }
 
 .camera-list {
-  width: 280px;
+  width: 320px;
   padding: 16px;
   flex-shrink: 0;
   background-color: var(--glass-bg);
@@ -135,18 +221,99 @@ export default {
   -webkit-backdrop-filter: blur(var(--glass-blur));
 }
 
-.camera-list h2 {
-  font-size: 16px;
+.camera-list-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
   margin-bottom: 16px;
-  color: var(--font-color);
   padding-bottom: 12px;
   border-bottom: 1px solid var(--glass-border-color);
-  text-align: center;
+}
+
+.camera-list h2 {
+  font-size: 16px;
+  color: var(--font-color);
+  margin: 0;
+}
+
+.refresh-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 6px;
+  transition: var(--base-transition);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--font-color-secondary);
+}
+
+.refresh-btn:hover:not(:disabled) {
+  background-color: var(--glass-hover-bg);
+  color: var(--primary-color);
+  transform: scale(1.1);
+}
+
+.refresh-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.refresh-icon {
+  font-size: 16px;
+  transition: transform 0.3s ease;
+}
+
+.refresh-icon.rotating {
+  animation: rotate 1s linear infinite;
+}
+
+@keyframes rotate {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.camera-groups {
+  max-height: calc(100vh - 200px);
+  overflow-y: auto;
+}
+
+.camera-group {
+  margin-bottom: 20px;
+}
+
+.group-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  background-color: rgba(59, 130, 246, 0.1);
+  border: 1px solid rgba(59, 130, 246, 0.2);
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--primary-color);
+}
+
+.group-name {
+  font-weight: 600;
+}
+
+.group-count {
+  font-size: 12px;
+  color: var(--font-color-secondary);
+  font-weight: normal;
 }
 
 .camera-item {
   padding: 12px 16px;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
   background-color: transparent;
   border: 1px solid var(--border-color);
   border-radius: 8px;
@@ -154,6 +321,36 @@ export default {
   transition: var(--base-transition);
   position: relative;
   overflow: hidden;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.camera-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.camera-name {
+  font-weight: 500;
+  margin-bottom: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.camera-details {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--font-color-secondary);
+}
+
+.camera-ip, .camera-type {
+  background-color: rgba(148, 163, 184, 0.1);
+  padding: 2px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
 }
 
 .camera-item:hover {
@@ -167,6 +364,23 @@ export default {
   background-color: var(--primary-color);
   border-color: var(--primary-color);
   box-shadow: 0 0 20px var(--primary-glow-color);
+}
+
+.camera-status {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-weight: 500;
+}
+
+.camera-status.active {
+  background-color: var(--success-color);
+  color: white;
+}
+
+.camera-status.inactive {
+  background-color: var(--danger-color);
+  color: white;
 }
 
 .video-display {
@@ -209,12 +423,13 @@ export default {
   left: 50%;
   transform: translate(-50%, -50%);
   color: var(--font-color);
-  font-size: 2rem;
+  font-size: 1.5rem;
   font-weight: bold;
   text-shadow: 0 0 10px var(--primary-glow-color);
   opacity: 0.7;
   z-index: 1;
   display: block;
+  text-align: center;
 }
 
 .video-card.active .video-placeholder {
@@ -250,7 +465,36 @@ export default {
   width: 100%;
   height: 100%;
   object-fit: cover;
-  border-radius: 12px;
   display: none;
+}
+
+/* 响应式设计 */
+@media (max-width: 1200px) {
+  .video-display.multi-view {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 768px) {
+  .content-area {
+    flex-direction: column;
+    gap: 16px;
+  }
+  
+  .camera-list {
+    width: 100%;
+  }
+  
+  .camera-groups {
+    max-height: 300px;
+  }
+  
+  .video-display {
+    grid-template-columns: 1fr;
+  }
+  
+  .video-display.multi-view {
+    grid-template-columns: 1fr;
+  }
 }
 </style> 

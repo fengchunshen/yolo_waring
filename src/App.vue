@@ -12,6 +12,7 @@
         :cameras="cameras"
         :active-cameras="activeCameras"
         @toggle-camera="toggleCamera"
+        @refresh-devices="handleRefreshDevices"
       />
     </div>
   </div>
@@ -36,19 +37,9 @@ export default {
     const currentTime = ref('')
     const connectionStatus = ref({ status: 'connected', message: '系统运行正常' })
     const alerts = ref([])
-    const activeCameras = ref([0]) // 默认激活第一个摄像头
+    const activeCameras = ref([]) // 动态激活的摄像头
     
-    const cameras = ref([
-      { id: 0, name: '三楼机房1号点位', active: true },
-      { id: 1, name: '三楼机房2号点位', active: false },
-      { id: 2, name: '三楼机房3号点位', active: false },
-      { id: 3, name: '四楼机房1号点位', active: false },
-      { id: 4, name: '四楼机房2号点位', active: false },
-      { id: 5, name: '四楼机房3号点位', active: false },
-      { id: 6, name: '五楼机房1号点位', active: false },
-      { id: 7, name: '五楼机房2号点位', active: false },
-      { id: 8, name: '五楼机房3号点位', active: false }
-    ])
+    const cameras = ref([]) // 从后端动态获取的摄像头列表
 
     let socket = null
     let timeInterval = null
@@ -64,6 +55,66 @@ export default {
         second: '2-digit',
         hour12: false
       }).replaceAll('/', '-')
+    }
+
+    // 从后端获取设备列表
+    const loadDevices = async () => {
+      try {
+        const response = await fetch(API_CONFIG.DEVICE_MANAGEMENT.getDevices())
+        if (response.ok) {
+          const result = await response.json()
+          if (result.code === 200) {
+            // 处理分组数据，转换为扁平化的设备列表
+            const allDevices = []
+            
+            // 检查数据是否为空
+            if (result.data && typeof result.data === 'object' && Object.keys(result.data).length > 0) {
+              // 遍历分组数据
+              Object.entries(result.data).forEach(([groupName, devices]) => {
+                if (Array.isArray(devices)) {
+                  devices.forEach(device => {
+                    allDevices.push({
+                      id: parseInt(device.id), // 确保ID是数字类型
+                      name: device.name,
+                      active: false, // 默认不激活
+                      rtspUrl: device.rtspUrl,
+                      status: device.status,
+                      groupName: groupName, // 添加分组信息
+                      ip: device.ip,
+                      type: device.type,
+                      userName: device.userName,
+                      facilityName: device.facilityName
+                    })
+                  })
+                }
+              })
+            }
+            
+            cameras.value = allDevices
+            
+            // 如果有设备，默认激活第一个
+            if (cameras.value.length > 0) {
+              cameras.value[0].active = true
+              activeCameras.value = [cameras.value[0].id]
+            }
+            
+            console.log(`成功加载 ${cameras.value.length} 个设备，分为 ${result.data ? Object.keys(result.data).length : 0} 个分组`)
+            console.log('设备列表:', cameras.value)
+            console.log('激活的设备:', activeCameras.value)
+          } else {
+            console.error('获取设备列表失败:', result.message)
+          }
+        } else {
+          console.error('获取设备列表请求失败:', response.status)
+        }
+      } catch (error) {
+        console.error('获取设备列表时发生错误:', error)
+        // 如果获取失败，使用默认设备列表作为备用
+        cameras.value = [
+          { id: 0, name: '默认设备', active: true, rtspUrl: '', status: 'inactive', groupName: '未分配摄像头' }
+        ]
+        activeCameras.value = [0]
+      }
     }
 
     const connectWebSocket = () => {
@@ -118,15 +169,14 @@ export default {
     }
 
     const addAlert = (data) => {
-      const locations = {
-        0: '三楼机房1号点位', 1: '三楼机房2号点位', 2: '三楼机房3号点位',
-        3: '四楼机房1号点位', 4: '四楼机房2号点位', 5: '四楼机房3号点位',
-        6: '五楼机房1号点位', 7: '五楼机房2号点位', 8: '五楼机房3号点位'
-      }
+      // 根据设备ID获取设备名称，确保ID类型匹配
+      const deviceId = parseInt(data.deviceId)
+      const device = cameras.value.find(c => c.id === deviceId)
+      const location = device ? device.name : '未知位置'
 
       const alert = {
         id: Date.now(),
-        location: locations[data.camera_id] || '未知位置',
+        location: location,
         confidence: data.confidence !== -1 ? (data.confidence * 100).toFixed(1) : '95.0',
         personId: data.person_id,
         duration: data.time_since_first ? Math.round(data.time_since_first) : 0,
@@ -160,20 +210,58 @@ export default {
     }
 
     const toggleCamera = (cameraId) => {
-      const camera = cameras.value.find(c => c.id === cameraId)
+      // 确保cameraId是数字类型
+      const id = parseInt(cameraId)
+      const camera = cameras.value.find(c => c.id === id)
+      console.log('切换摄像头:', { cameraId, id, camera, activeCameras: activeCameras.value })
       if (camera) {
         camera.active = !camera.active
         if (camera.active) {
-          activeCameras.value.push(cameraId)
+          activeCameras.value.push(id)
         } else {
-          activeCameras.value = activeCameras.value.filter(id => id !== cameraId)
+          activeCameras.value = activeCameras.value.filter(activeId => activeId !== id)
         }
+        console.log('切换后状态:', { camera: camera.active, activeCameras: activeCameras.value })
       }
     }
 
-    onMounted(() => {
+    // 处理刷新设备列表
+    const handleRefreshDevices = async () => {
+      try {
+        console.log('开始刷新设备列表...')
+        
+        // 调用后端刷新接口
+        const response = await fetch(API_CONFIG.DEVICE_MANAGEMENT.refreshDevices(), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        })
+        
+        if (response.ok) {
+          const result = await response.json()
+          if (result.code === 200) {
+            console.log('后端刷新成功:', result.message)
+            // 重新加载设备列表
+            await loadDevices()
+            console.log('前端设备列表更新完成')
+          } else {
+            console.error('后端刷新失败:', result.message)
+          }
+        } else {
+          console.error('刷新请求失败:', response.status)
+        }
+      } catch (error) {
+        console.error('刷新设备列表时发生错误:', error)
+      }
+    }
+
+    onMounted(async () => {
       updateTime()
       timeInterval = setInterval(updateTime, 1000)
+      
+      // 先加载设备列表，再连接WebSocket
+      await loadDevices()
       connectWebSocket()
     })
 
@@ -192,7 +280,8 @@ export default {
       alerts,
       cameras,
       activeCameras,
-      toggleCamera
+      toggleCamera,
+      handleRefreshDevices
     }
   }
 }
